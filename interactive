@@ -1,0 +1,332 @@
+#!/usr/bin/env python
+
+# This is free and unencumbered software released into the public domain.
+
+# Anyone is free to copy, modify, publish, use, compile, sell, or
+# distribute this software, either in source code form or as a compiled
+# binary, for any purpose, commercial or non-commercial, and by any
+# means.
+
+# In jurisdictions that recognize copyright laws, the author or authors
+# of this software dedicate any and all copyright interest in the
+# software to the public domain. We make this dedication for the benefit
+# of the public at large and to the detriment of our heirs and
+# successors. We intend this dedication to be an overt act of
+# relinquishment in perpetuity of all present and future rights to this
+# software under copyright law.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+# OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+# ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+
+# For more information, please refer to <http://unlicense.org/
+
+# Author: Enrico Rippin <enrico.rippin@gmx.de> 2024
+# Last Update: 2024-09-05
+# Version: 1.0
+
+import argparse
+import json
+import os
+import readline # Module import itself already activates the input history.
+import subprocess
+import sys
+import threading
+import time
+
+from enum import Enum
+from pathlib import Path
+from queue import Queue, Empty
+
+from setproctitle import setproctitle
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+
+# 1 CONFIG FILE STRUCTURE
+
+_settings_template = f"""
+{{
+	"monitored_dirs": ["./"],
+	"program": "echo",
+	"args": "Hello, World!"
+}}
+"""
+
+
+# 2 GENERAL AUXILIARY FUNCTIONS
+
+def format_output(out: str) -> str:
+	return  "┌─────────\n" + "\n".join(f"│ {line}" for line in out.splitlines()) + "\n└─────────"
+
+
+# 3 IMPLEMENTATION OF THE CONSOLE PROGRAM
+
+class App:
+	
+	class State(Enum):
+		Initialized = 0 
+		Prompting = 1
+		Starting = 2
+		Executed = 3
+
+
+	config_file_name = "interactive.json"
+
+
+	def __init__(self):
+		setproctitle('interactive program execution')
+
+		parser = argparse.ArgumentParser(
+			prog="interactive",
+			description="Interactive environment for automatically executing programs with any arguments when local files change."
+		)
+		subparsers = parser.add_subparsers(dest="subcommand", help="Subcommands")
+		init_parser = subparsers.add_parser('init', help=f"Create configuration file './{App.config_file_name}' locally.")
+
+		self.__dict__.update(vars(parser.parse_args()))
+
+		# Program parameters that can be user-configurable:
+		self.feedback_prefix = "  "
+		self.input_prefix = "> "
+		self.separator = "──────────"
+		self.max_history_size = 3 # Maximum number of commands to keep in history.
+		self.latency = 100 # Waiting time in ms after the last file change before the program is executed again.
+
+		self.monitored_dirs = [Path.cwd()]
+		self.program = None # External program that should be executed automatically when files change.
+		self.args = None # Only separated to reduce typing required to call the external program with different args.
+
+		# Internal caching variables that should not be changed by the user:
+		self.config_file = None
+		self.state = App.State.Initialized
+		self.stop_event = threading.Event() # Event to stop the monitoring thread.
+		self.process = None # To keep track of the running process.
+		self.last_change_time = 0 # Time of the last file change.
+		self.timer = None # Timer to handle latency.
+
+		if self.subcommand == "init":
+			self.create_config_file()
+			sys.exit(0)
+		else:
+			self.read_settings()
+			
+			# Start the interactive environment:
+			self.interactive_environment()
+
+
+	def create_config_file(self):
+		"""Create a local configuration file if it does not already exist."""
+		config_file = Path.cwd() / App.config_file_name
+
+		if not config_file.exists():
+			try:
+				with open(config_file, 'w') as file_handle:
+					file_handle.write(_settings_template.strip())
+				print(f"Configuration file '{config_file}' created")
+			except Exception as e:
+				print(f"{str(e)}")
+		else:
+			print(f"Configuration file '{config_file}' already exists")
+
+
+	def read_settings(self):
+		possible_files = [
+			Path.cwd() / App.config_file_name,
+			Path.cwd() / f".{App.config_file_name}"
+		]
+
+		for file in possible_files:
+			if file.exists():
+				self.config_file = file
+				break
+
+		try:
+			with open(self.config_file, 'r') as file_handle:
+				settings = json.load(file_handle)
+
+				self.monitored_dirs = [Path(p) for p in settings["monitored_dirs"]]	
+				if not bool(self.monitored_dirs):
+					self.monitored_dirs = [Path.cwd()]
+					
+				self.program = settings["program"]
+				self.args = settings["args"]
+
+		except KeyError as e:
+			print(f"No setting for '{e.args[0]}' in '{self.config_file}'")
+		except FileNotFoundError:
+			print(f"No configuration file './{App.config_file_name}' found")
+		except PermissionError:
+			print(f"No permission to open '{self.config_file}'")
+		except Exception as e:
+			print(f"{e}")
+
+
+	@property
+	def command(self):
+		return f"{self.program} {self.args}" if bool(self.args) else self.program
+
+
+	def start_monitoring(self):
+
+		def file_monitoring():
+
+			class ChangeHandler(FileSystemEventHandler):
+				def __init__(self, app):
+					self.app = app
+
+				def indicate_file_change(self):
+					print(f"\n{self.app.feedback_prefix}File changed\n{self.app.input_prefix}", end='', flush=True)
+
+
+				def on_any_event(self, event):
+					"""Handle file changes with latency consideration."""
+					if event.event_type in ('modified', 'created', 'moved', 'deleted'):
+						self.app.last_change_time = time.time() # Update the time of the last file change.
+						if self.app.timer:
+							self.app.timer.cancel() # Cancel any existing timer.
+						self.app.timer = threading.Timer(
+							self.app.latency / 1000.0,
+							self.app.execute_command if bool(self.app.command) else self.indicate_file_change
+						)
+						self.app.timer.start()
+
+			observers = []
+			for directory in self.monitored_dirs:
+				event_handler = ChangeHandler(self)
+				observer = Observer()
+				observer.schedule(event_handler, path=directory, recursive=True)
+				observer.start()
+				observers.append(observer)
+
+			try:
+				while not self.stop_event.is_set():
+					self.stop_event.wait(timeout=1) # Check periodically if the stop_event is set.
+			finally:
+				for observer in observers:
+					observer.stop()
+					observer.join()
+				self.terminate_process()
+
+		self.stop_event.clear()
+		self.monitoring_thread = threading.Thread(target=file_monitoring, daemon=True)
+		self.monitoring_thread.start()
+
+
+	def terminate_process(self):
+		"""Terminate the running process if it exists."""
+		self.stop_event.set() # Stop current monitoring.
+
+		if bool(self.process):
+			self.process.terminate()
+			self.process.wait()
+			self.process = None
+
+
+	def interactive_environment(self):
+		print("Type 'start <command>' to set the command executed and start monitoring.")
+		print("Type 'close' to exit interactive environment.")
+		print(self.separator)
+
+		# If command was read from a config file, execute automatically with start:
+		if bool(self.command):
+			self.start_monitoring()
+			self.execute_command()
+
+		readline.set_history_length(self.max_history_size)
+			# This setting currently has no effect, possibly a bug (with Ubuntu 22.04)? 
+
+		while True:
+			self.state = App.State.Prompting
+			user_input = input(f"{self.input_prefix}").strip()
+			sys.stdout.flush()
+
+			parts = user_input.split(' ', 1)
+			if len(parts) == 2:
+				option, value = parts
+			else:
+				option, value = user_input, None
+
+			match option:
+				case "a" | "apply":
+					if bool(value):
+						self.args = value
+						self.state = App.State.Starting
+						self.execute_command()
+					else:
+						print(f"{self.feedback_prefix}No new arguments set")
+				
+				case "k" | "kill":
+					self.terminate_process()
+
+				case "r" | "restart":
+					self.terminate_process() # Terminate any running process
+
+					# Reset stop event and start a new monitoring thread
+					self.start_monitoring()
+					
+					self.state = App.State.Starting
+					self.execute_command()
+
+				case "s" | "start":
+					if bool(value):
+						command_parts = value.split(' ', 1)
+						if len(command_parts) == 2:
+							self.program, self.args = command_parts
+						else:
+							self.program, self.args = value, None
+
+						self.start_monitoring()
+						self.state = App.State.Starting
+						self.execute_command()
+
+					else:
+						print(f"{self.feedback_prefix}No command set to execute")
+
+				case "q" | "quit" | "exit":
+					print(f"Closing interactive program environment...")
+					self.stop_event.set() # Signal the monitoring thread to stop.
+					break
+
+				case _:
+					print(f"{self.feedback_prefix}No valid option")
+
+
+	def execute_command(self):
+		"""Terminate any running process and (re)execute the command."""
+		
+		#print(f"self.state = {self.state}")
+		print("\n" if self.state in {App.State.Initialized, App.State.Starting} else "\n\n", end="")
+
+		try:
+			# Run the command in the shell:
+			result = subprocess.run(
+				self.command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+			
+			output = result.stdout.rstrip()
+			stderr = result.stderr.rstrip()
+			
+			# Print output of the external program:
+
+			if bool(stderr):
+				output += f"\n\n{stderr}"
+				print(f"{self.feedback_prefix}External program terminated with error:")
+
+			print(format_output(output))
+			print(f"{self.feedback_prefix}Executed: {self.command}\n", flush=True)
+		
+		except Exception as e:
+			print(f"{self.feedback_prefix}Error occurred: {str(e)}")
+
+		if self.state not in {App.State.Initialized, App.State.Starting}:
+			print(f"{self.input_prefix}", end='', flush=True)
+
+		self.state = App.State.Executed
+
+
+if __name__ == "__main__":
+	App()
