@@ -1,6 +1,6 @@
 # Interactive Program Execution Environment 1.0
 
-**Interactive Program Execution Environment 1.0** is a CLI tool designed to automatically execute programs in response to changes in local files. It monitors directories for changes, and when a file change is detected, the configured external program (with optional arguments) gets executed. 
+**Interactive Program Execution Environment 1.0** is a CLI tool designed to automatically execute programs in response to changes in local files. It monitors directories, and when a file change is detected, the specified external program (with optional arguments) gets called.
 
 ## Features
 
